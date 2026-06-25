@@ -43,6 +43,16 @@ class Config(BaseSettings):
 	oauth2_access_ttl: int = Field(default=3600, description="TTL access token в секундах")
 	oauth2_refresh_ttl: int = Field(default=1209600, description="TTL refresh token в секундах (14 дней)")
 	forwarded_allow_ips: str = Field(default="127.0.0.1", description="Доверенные IP прокси для X-Forwarded-* заголовков (uvicorn)")
+
+	# Настройки хранилища OAuth2 данных
+	storage_backend: Literal["memory", "sqlite"] = Field(
+		default="sqlite",
+		description="Backend хранения OAuth2 данных: sqlite (персистентный) или memory (только RAM)"
+	)
+	storage_path: str = Field(
+		default="data/oauth2.db",
+		description="Путь к файлу SQLite (для storage_backend=sqlite)"
+	)
 	
 	class Config:
 		env_file = ".env"

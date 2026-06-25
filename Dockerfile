@@ -17,6 +17,9 @@ RUN pip install --no-cache-dir -r /app/src/py_server/requirements.txt
 # Копирование исходного кода
 COPY src/py_server /app/src/py_server
 
+# Директория для персистентного хранения данных OAuth2
+RUN mkdir -p /app/data
+
 # Порт по умолчанию
 EXPOSE 8000
 

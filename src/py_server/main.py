@@ -61,6 +61,8 @@ def create_parser() -> argparse.ArgumentParser:
   MCP_OAUTH2_CODE_TTL    - TTL authorization code в секундах (по умолчанию: 120)
   MCP_OAUTH2_ACCESS_TTL  - TTL access token в секундах (по умолчанию: 3600)
   MCP_OAUTH2_REFRESH_TTL - TTL refresh token в секундах (по умолчанию: 1209600)
+  MCP_STORAGE_BACKEND    - Backend хранения: sqlite (по умолчанию) или memory
+  MCP_STORAGE_PATH       - Путь к файлу SQLite (по умолчанию: data/oauth2.db)
 		"""
 	)
 	

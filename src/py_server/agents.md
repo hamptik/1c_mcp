@@ -72,8 +72,10 @@ src/py_server/
 ├── stdio_server.py                  # Stdio транспорт
 │
 ├── auth/                            # Подсистема авторизации
-│   ├── __init__.py
-│   └── oauth2.py                    # OAuth2 Store + Service
+│   ├── __init__.py                  # Экспорты
+│   ├── store_base.py                # OAuth2StoreBase (ABC) + модели данных
+│   ├── oauth2.py                    # InMemoryOAuth2Store + OAuth2Service
+│   └── sqlite_store.py              # SqliteOAuth2Store (персистентный)
 │
 ├── requirements.txt                 # Python зависимости
 ├── env.example                      # Пример .env конфигурации
@@ -356,9 +358,10 @@ class MCPHttpServer:
 **Методы:**
 
 1. `async _lifespan(app: FastAPI)`
+   - Инициализация хранилища OAuth2 (`store.initialize()` — SQLite: создание таблиц, подключение)
    - Запуск задачи очистки OAuth2 токенов (если включено)
    - Запуск `streamable_session_manager.run()`
-   - Cleanup при завершении
+   - Cleanup при завершении: остановка очистки, `store.close()`
 
 2. `_create_sse_starlette_app() -> Starlette`
    - Создание Starlette app для SSE транспорта
@@ -387,7 +390,7 @@ class MCPHttpServer:
      - `GET /.well-known/oauth-authorization-server` → AS Metadata (RFC 8414)
    
    - **Dynamic Client Registration (RFC 7591):**
-     - `POST /register` → фиксированный `client_id = "mcp-public-client"`
+     - `POST /register` → создаёт новый client_id, сохраняет в хранилище (SQLite/память)
    
    - **Authorization Code Flow:**
      - `GET /authorize` → HTML форма логин/пароль
@@ -406,7 +409,7 @@ class MCPHttpServer:
 - `FastAPI`, `uvicorn` - HTTP сервер
 - `mcp.server.sse.SseServerTransport` - SSE транспорт
 - `mcp.server.streamable_http_manager.StreamableHTTPSessionManager` - Streamable HTTP
-- `auth.OAuth2Service`, `auth.OAuth2Store` - OAuth2 логика
+- `auth.OAuth2Service`, `auth.OAuth2StoreBase`, `auth.SqliteOAuth2Store` - OAuth2 логика и хранилище
 
 ---
 
@@ -440,9 +443,11 @@ async def run_stdio_server(config: Config):
 
 Расположена в модуле `auth/`, реализует опциональную OAuth2 авторизацию.
 
-### Модуль `auth/oauth2.py`
+### Модуль `auth/store_base.py`
 
-#### Модели данных (dataclasses):
+Абстрактный базовый класс `OAuth2StoreBase` (ABC) и модели данных (dataclasses).
+
+**Модели данных:**
 
 ```python
 @dataclass
@@ -465,45 +470,49 @@ class RefreshTokenData:
 	password: str
 	exp: datetime
 	rotation_counter: int = 0
+
+@dataclass
+class ClientData:
+	client_id: str
+	client_secret: str = ""
+	redirect_uris: List[str] = ...
+	grant_types: List[str] = ...
+	response_types: List[str] = ...
+	token_endpoint_auth_method: str = "none"
+	application_type: str = "web"
+	client_id_issued_at: float = 0.0
+	client_name: Optional[str] = None
 ```
 
-#### Класс `OAuth2Store`
+#### Класс `OAuth2StoreBase` (ABC)
+
+**Назначение:** Интерфейс хранилища OAuth2. Все методы — async.
+
+**Lifecycle:**
+- `async initialize()` — инициализация (создание таблиц / подключение к БД)
+- `async close()` — закрытие соединений
+- `async start_cleanup_task(interval: int = 60)` / `async stop_cleanup_task()`
+
+**Методы (все async):**
+
+| Категория | Методы |
+|-----------|--------|
+| Auth Codes | `save_auth_code(code, data)`, `get_auth_code(code)` — одноразовый |
+| Access Tokens | `save_access_token(token, data)`, `get_access_token(token)`, `delete_access_token(token)` |
+| Refresh Tokens | `save_refresh_token(token, data)`, `get_refresh_token(token)` — ротация, `delete_refresh_token(token)` |
+| Clients | `save_client(client_id, data)`, `get_client(client_id)` |
+| Cleanup | `async cleanup_expired()` |
+
+### Модуль `auth/oauth2.py`
+
+#### Класс `InMemoryOAuth2Store(OAuth2StoreBase)`
 
 **Назначение:** In-memory хранилище токенов с автоматической очисткой по TTL.
-
-**Структуры данных:**
-
-```python
-self.auth_codes: Dict[str, AuthCodeData] = {}
-self.access_tokens: Dict[str, AccessTokenData] = {}
-self.refresh_tokens: Dict[str, RefreshTokenData] = {}
-self._cleanup_task: Optional[asyncio.Task] = None
-```
-
-**Методы:**
-
-1. **Управление задачей очистки:**
-   - `async start_cleanup_task(interval: int = 60)`
-   - `async stop_cleanup_task()`
-   - `async _cleanup_loop(interval: int)` - периодический цикл
-   - `_cleanup_expired()` - удаление истёкших токенов
-
-2. **Authorization Codes:**
-   - `save_auth_code(code: str, data: AuthCodeData)`
-   - `get_auth_code(code: str) -> Optional[AuthCodeData]` - одноразовый (удаляется при чтении)
-
-3. **Access Tokens:**
-   - `save_access_token(token: str, data: AccessTokenData)`
-   - `get_access_token(token: str) -> Optional[AccessTokenData]` - проверка TTL
-
-4. **Refresh Tokens:**
-   - `save_refresh_token(token: str, data: RefreshTokenData)`
-   - `get_refresh_token(token: str) -> Optional[RefreshTokenData]` - удаляется при чтении (ротация)
 
 **Особенности:**
 - Всё в оперативной памяти (при рестарте сброс)
 - Автоматическая очистка по TTL каждые 60 секунд
-- Логирование всех операций
+- Alias: `OAuth2Store = InMemoryOAuth2Store`
 
 #### Класс `OAuth2Service`
 
@@ -511,42 +520,40 @@ self._cleanup_task: Optional[asyncio.Task] = None
 
 ```python
 class OAuth2Service:
-	def __init__(self, store: OAuth2Store, code_ttl: int, access_ttl: int, refresh_ttl: int):
+	def __init__(self, store: OAuth2StoreBase, code_ttl: int, access_ttl: int, refresh_ttl: int):
 		self.store = store
 		self.code_ttl = code_ttl      # 120 сек
 		self.access_ttl = access_ttl  # 3600 сек
 		self.refresh_ttl = refresh_ttl  # 1209600 сек (14 дней)
 ```
 
-**Методы:**
+**Методы (store-зависимые — async, чистая логика — sync):**
 
-1. `generate_prm_document(public_url: str) -> dict`
+1. `generate_prm_document(public_url: str) -> dict` — sync
    - Генерация Protected Resource Metadata (RFC 9728)
-   - Возвращает JSON с `resource`, `authorization_servers`, endpoints
 
-2. `generate_authorization_code(login, password, redirect_uri, code_challenge) -> str`
-   - Генерация случайного кода (secrets.token_urlsafe)
-   - Сохранение в store с TTL
+2. `async register_client(redirect_uris, client_name) -> ClientData` — **async**
+   - Генерация уникального `client_id = "mcp_" + secrets.token_urlsafe(16)`
+   - Сохранение в store
 
-3. `validate_pkce(code_verifier: str, code_challenge: str) -> bool`
-   - Вычисление SHA256 от verifier
-   - Base64url encoding и сравнение с challenge
-   - **Только S256**, plain не поддерживается
+3. `async is_redirect_uri_valid(client_id, redirect_uri) -> bool` — **async**
+   - Проверка URI: default URIs (localhost) + зарегистрированные клиентом URIs
 
-4. `exchange_code_for_tokens(code, redirect_uri, code_verifier) -> Optional[Tuple[...]]`
+4. `async generate_authorization_code(login, password, redirect_uri, code_challenge) -> str` — **async**
+   - Генерация случайного кода (secrets.token_urlsafe), сохранение в store с TTL
+
+5. `validate_pkce(code_verifier: str, code_challenge: str) -> bool` — sync
+   - Валидация PKCE S256: SHA256 + Base64url
+
+6. `async exchange_code_for_tokens(code, redirect_uri, code_verifier) -> Optional[Tuple[...]]` — **async**
    - Получение и удаление authorization code
-   - Проверка redirect_uri
-   - Валидация PKCE
-   - Генерация access + refresh токенов
+   - Проверка redirect_uri и PKCE
    - Возврат: `(access_token, "Bearer", expires_in, refresh_token)`
 
-5. `refresh_tokens(refresh_token: str) -> Optional[Tuple[...]]`
-   - Получение и удаление старого refresh (ротация!)
-   - Генерация новых access + refresh токенов
-   - Инкремент rotation_counter
+7. `async refresh_tokens(refresh_token: str) -> Optional[Tuple[...]]` — **async**
+   - Ротация refresh token, генерация новых токенов
 
-6. `validate_access_token(token: str) -> Optional[Tuple[str, str]]`
-   - Проверка токена в store
+8. `async validate_access_token(token: str) -> Optional[Tuple[str, str]]` — **async**
    - Возврат `(login, password)` или `None`
 
 **Особенности:**
@@ -653,6 +660,8 @@ class OAuth2Service:
 - `MCP_OAUTH2_CODE_TTL` - TTL authorization code в секундах (по умолчанию: `120`)
 - `MCP_OAUTH2_ACCESS_TTL` - TTL access token в секундах (по умолчанию: `3600`)
 - `MCP_OAUTH2_REFRESH_TTL` - TTL refresh token в секундах (по умолчанию: `1209600`)
+- `MCP_STORAGE_BACKEND` - backend хранения: `sqlite` (по умолчанию) или `memory`
+- `MCP_STORAGE_PATH` - путь к файлу SQLite (по умолчанию: `data/oauth2.db`)
 - `MCP_FORWARDED_ALLOW_IPS` - доверенные IP прокси для X-Forwarded-* заголовков (по умолчанию: `127.0.0.1`)
   - `MCP_ONEC_USERNAME`/`MCP_ONEC_PASSWORD` игнорируются при `MCP_AUTH_MODE=oauth2`
 
@@ -720,7 +729,7 @@ ReadResourceContents(content: str | bytes, mime_type: str)
 Config (Pydantic BaseSettings)
 
 # OAuth2
-AuthCodeData, AccessTokenData, RefreshTokenData (dataclasses)
+AuthCodeData, AccessTokenData, RefreshTokenData, ClientData (dataclasses)
 
 # Context vars
 Tuple[str, str]  # (username, password) в current_onec_credentials
@@ -940,19 +949,26 @@ async def call_tool(name, arguments):
 
 ### 6. Альтернативные хранилища для OAuth2
 
-Заменить `OAuth2Store` на Redis/PostgreSQL:
+Реализовано два backend'а:
+- `InMemoryOAuth2Store` — хранение в RAM (сброс при рестарте)
+- `SqliteOAuth2Store` — персистентное хранение на диске (WAL mode)
+
+Выбор backend'а — через `MCP_STORAGE_BACKEND=sqlite|memory`.
+
+Для добавления нового backend (например, Redis/PostgreSQL) — унаследоваться от `OAuth2StoreBase`:
 
 ```python
-class RedisOAuth2Store(OAuth2Store):
+class RedisOAuth2Store(OAuth2StoreBase):
 	def __init__(self, redis_client):
 		self.redis = redis_client
-	
-	def save_access_token(self, token, data):
-		self.redis.setex(
+
+	async def save_access_token(self, token, data):
+		await self.redis.setex(
 			f"access:{token}",
-			data.exp.timestamp(),
+			int(data.exp.timestamp()),
 			json.dumps(dataclasses.asdict(data))
 		)
+	# ... реализовать остальные async-методы
 ```
 
 ### 7. Динамическая маршрутизация 1С

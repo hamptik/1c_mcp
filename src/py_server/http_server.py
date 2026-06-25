@@ -21,7 +21,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from .mcp_server import MCPProxy, current_onec_credentials
 from .config import Config
-from .auth import OAuth2Service, OAuth2Store
+from .auth import (
+	OAuth2Service,
+	OAuth2StoreBase,
+	InMemoryOAuth2Store,
+	SqliteOAuth2Store,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -77,7 +82,7 @@ class OAuth2BearerMiddleware(BaseHTTPMiddleware):
 		
 		# 2. OAuth2 формат: через хранилище
 		if not creds:
-			creds = self.oauth2_service.validate_access_token(token)
+			creds = await self.oauth2_service.validate_access_token(token)
 		
 		if not creds:
 			return JSONResponse(
@@ -111,10 +116,15 @@ class MCPHttpServer:
 		self.streamable_session_manager = StreamableHTTPSessionManager(self.mcp_proxy.server)
 		
 		# Инициализация OAuth2 (если включено)
-		self.oauth2_store: Optional[OAuth2Store] = None
+		self.oauth2_store: Optional[OAuth2StoreBase] = None
 		self.oauth2_service: Optional[OAuth2Service] = None
 		if config.auth_mode == "oauth2":
-			self.oauth2_store = OAuth2Store()
+			if config.storage_backend == "sqlite":
+				self.oauth2_store = SqliteOAuth2Store(config.storage_path)
+				logger.info(f"OAuth2: используется SQLite хранилище ({config.storage_path})")
+			else:
+				self.oauth2_store = InMemoryOAuth2Store()
+				logger.info("OAuth2: используется in-memory хранилище")
 			self.oauth2_service = OAuth2Service(
 				self.oauth2_store,
 				code_ttl=config.oauth2_code_ttl,
@@ -157,17 +167,19 @@ class MCPHttpServer:
 		"""Управление жизненным циклом приложения."""
 		logger.debug("Запуск HTTP-сервера MCP")
 		
-		# Запускаем задачу очистки OAuth2 токенов (если включено)
+		# Инициализируем хранилище OAuth2 и запускаем очистку токенов
 		if self.oauth2_store:
+			await self.oauth2_store.initialize()
 			await self.oauth2_store.start_cleanup_task(interval=60)
 		
 		# Запускаем session manager для Streamable HTTP
 		async with self.streamable_session_manager.run():
 			yield
 		
-		# Останавливаем задачу очистки OAuth2
+		# Останавливаем очистку и закрываем хранилище OAuth2
 		if self.oauth2_store:
 			await self.oauth2_store.stop_cleanup_task()
+			await self.oauth2_store.close()
 		
 		logger.debug("Остановка HTTP-сервера MCP")
 	
@@ -358,11 +370,6 @@ class MCPHttpServer:
 	def _register_oauth2_routes(self):
 		"""Регистрация OAuth2 маршрутов."""
 		
-		self.oauth2_service.registered_redirect_uris = {
-			"http://localhost/callback",
-			"http://127.0.0.1/callback",
-		}
-		
 		@self.app.get("/.well-known/oauth-protected-resource")
 		async def well_known_prm(request: Request):
 			"""Protected Resource Metadata (RFC 9728)."""
@@ -407,31 +414,21 @@ class MCPHttpServer:
 		
 		@self.app.post("/register")
 		async def register_client(request: Request):
-			"""Dynamic Client Registration (RFC 7591) - упрощённая версия.
+			"""Dynamic Client Registration (RFC 7591).
 			
-			Всегда возвращает фиксированный client_id для публичного клиента.
-			Игнорирует параметры регистрации, т.к. у нас нет реальной БД клиентов.
+			Создаёт нового клиента с уникальным client_id и сохраняет в хранилище.
 			"""
-			# Читаем тело запроса (но не используем, т.к. всё равно вернём фиксированные данные)
 			try:
 				body = await request.json()
 				logger.debug(f"Client registration request: {body}")
-			except:
+			except Exception:
 				body = {}
-			
-			# Определяем публичный URL для redirect_uris
-			if self.config.public_url:
-				base_url = self.config.public_url
-			else:
-				scheme = request.url.scheme
-				netloc = request.headers.get("host", f"{request.client.host}:{request.url.port}")
-				base_url = f"{scheme}://{netloc}"
-			
-			# Собираем URI от клиента (приоритетные), сохраняя порядок и убирая дубли
+
+			# Собираем URI от клиента
 			client_uris = list(dict.fromkeys(
 				uri for uri in body.get("redirect_uris", []) if uri
 			)) if "redirect_uris" in body else []
-			
+
 			# Fallback URI для CLI/локальных клиентов
 			fallback_uris = [
 				"http://localhost/callback",
@@ -439,24 +436,16 @@ class MCPHttpServer:
 			]
 			filtered_fallback = [u for u in fallback_uris if u not in client_uris]
 			all_uris = client_uris + filtered_fallback
-			
-			# Возвращаем фиксированные данные публичного клиента
-			client_data = {
-				"client_id": "mcp-public-client",
-				"client_secret": "",  # Пустой для публичного клиента
-				"client_id_issued_at": 1640000000,  # Фиксированная дата
-				"grant_types": ["authorization_code", "refresh_token", "password"],
-				"response_types": ["code"],
-				"redirect_uris": all_uris,
-				"token_endpoint_auth_method": "none",  # Публичный клиент
-				"application_type": "web"
-			}
-			
-			self.oauth2_service.registered_redirect_uris.update(all_uris)
-			
-			logger.info(f"Client registration: вернули client_id='mcp-public-client', redirect_uris={all_uris}")
-			
-			return client_data
+
+			# Регистрируем клиент в хранилище
+			client_data = await self.oauth2_service.register_client(
+				redirect_uris=all_uris,
+				client_name=body.get("client_name"),
+			)
+
+			logger.info(f"Client registration: client_id='{client_data.client_id}', redirect_uris={all_uris}")
+
+			return client_data.to_dict()
 		
 		@self.app.get("/authorize")
 		async def authorize_get(
@@ -476,8 +465,8 @@ class MCPHttpServer:
 					status_code=400
 				)
 			
-			# Валидация redirect_uri против зарегистрированных
-			if self.oauth2_service.registered_redirect_uris and redirect_uri not in self.oauth2_service.registered_redirect_uris:
+			# Валидация redirect_uri через сервис
+			if not await self.oauth2_service.is_redirect_uri_valid(client_id, redirect_uri):
 				return HTMLResponse(
 					content="<html><body><h1>Ошибка</h1><p>Незарегистрированный redirect_uri</p></body></html>",
 					status_code=400
@@ -497,6 +486,7 @@ class MCPHttpServer:
 			
 			# Сохраняем параметры в query для формы
 			query_params = urlencode({
+				"client_id": client_id or "",
 				"redirect_uri": redirect_uri,
 				"state": state or "",
 				"code_challenge": code_challenge
@@ -542,6 +532,7 @@ class MCPHttpServer:
 			request: Request,
 			username: str = Form(...),
 			password: str = Form(...),
+			client_id: str = None,
 			redirect_uri: str = None,
 			state: str = None,
 			code_challenge: str = None
@@ -553,7 +544,7 @@ class MCPHttpServer:
 					status_code=400
 				)
 			
-			if self.oauth2_service.registered_redirect_uris and redirect_uri not in self.oauth2_service.registered_redirect_uris:
+			if not await self.oauth2_service.is_redirect_uri_valid(client_id, redirect_uri):
 				return HTMLResponse(
 					content="<html><body><h1>Ошибка</h1><p>Незарегистрированный redirect_uri</p></body></html>",
 					status_code=400
@@ -628,7 +619,7 @@ class MCPHttpServer:
 				)
 			
 			# Генерируем authorization code
-			code = self.oauth2_service.generate_authorization_code(
+			code = await self.oauth2_service.generate_authorization_code(
 				login=username,
 				password=password,
 				redirect_uri=redirect_uri,
@@ -723,7 +714,7 @@ class MCPHttpServer:
 						content={"error": "invalid_request", "error_description": "Missing required parameters"}
 					)
 				
-				result = self.oauth2_service.exchange_code_for_tokens(code, redirect_uri, code_verifier)
+				result = await self.oauth2_service.exchange_code_for_tokens(code, redirect_uri, code_verifier)
 				if not result:
 					return JSONResponse(
 						status_code=400,
@@ -747,7 +738,7 @@ class MCPHttpServer:
 						content={"error": "invalid_request", "error_description": "Missing refresh_token"}
 					)
 				
-				result = self.oauth2_service.refresh_tokens(refresh_token)
+				result = await self.oauth2_service.refresh_tokens(refresh_token)
 				if not result:
 					return JSONResponse(
 						status_code=400,
