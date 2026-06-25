@@ -49,7 +49,7 @@ class ClientData:
 	response_types: List[str] = field(default_factory=lambda: ["code"])
 	token_endpoint_auth_method: str = "none"
 	application_type: str = "web"
-	client_id_issued_at: float = 0.0
+	client_id_issued_at: int = 0
 	client_name: Optional[str] = None
 
 	def to_dict(self) -> dict:

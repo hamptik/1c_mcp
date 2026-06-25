@@ -192,7 +192,7 @@ class OAuth2Service:
 			response_types=["code"],
 			token_endpoint_auth_method="none",
 			application_type="web",
-			client_id_issued_at=datetime.now().timestamp(),
+			client_id_issued_at=int(datetime.now().timestamp()),
 			client_name=client_name,
 		)
 
