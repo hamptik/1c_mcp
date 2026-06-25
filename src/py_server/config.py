@@ -42,6 +42,7 @@ class Config(BaseSettings):
 	oauth2_code_ttl: int = Field(default=120, description="TTL authorization code в секундах")
 	oauth2_access_ttl: int = Field(default=3600, description="TTL access token в секундах")
 	oauth2_refresh_ttl: int = Field(default=1209600, description="TTL refresh token в секундах (14 дней)")
+	forwarded_allow_ips: str = Field(default="127.0.0.1", description="Доверенные IP прокси для X-Forwarded-* заголовков (uvicorn)")
 	
 	class Config:
 		env_file = ".env"

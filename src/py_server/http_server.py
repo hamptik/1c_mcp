@@ -358,6 +358,11 @@ class MCPHttpServer:
 	def _register_oauth2_routes(self):
 		"""Регистрация OAuth2 маршрутов."""
 		
+		self.oauth2_service.registered_redirect_uris = {
+			"http://localhost/callback",
+			"http://127.0.0.1/callback",
+		}
+		
 		@self.app.get("/.well-known/oauth-protected-resource")
 		async def well_known_prm(request: Request):
 			"""Protected Resource Metadata (RFC 9728)."""
@@ -422,12 +427,10 @@ class MCPHttpServer:
 				netloc = request.headers.get("host", f"{request.client.host}:{request.url.port}")
 				base_url = f"{scheme}://{netloc}"
 			
-			# Собираем URI от клиента (приоритетные)
-			client_uris = []
-			if "redirect_uris" in body:
-				for uri in body.get("redirect_uris", []):
-					if uri and uri not in client_uris:
-						client_uris.append(uri)
+			# Собираем URI от клиента (приоритетные), сохраняя порядок и убирая дубли
+			client_uris = list(dict.fromkeys(
+				uri for uri in body.get("redirect_uris", []) if uri
+			)) if "redirect_uris" in body else []
 			
 			# Fallback URI для CLI/локальных клиентов
 			fallback_uris = [
@@ -449,8 +452,7 @@ class MCPHttpServer:
 				"application_type": "web"
 			}
 			
-			# Сохраняем зарегистрированные URI для валидации в /authorize
-			self.oauth2_service.registered_redirect_uris = set(all_uris)
+			self.oauth2_service.registered_redirect_uris.update(all_uris)
 			
 			logger.info(f"Client registration: вернули client_id='mcp-public-client', redirect_uris={all_uris}")
 			
@@ -477,14 +479,7 @@ class MCPHttpServer:
 			# Валидация redirect_uri против зарегистрированных
 			if self.oauth2_service.registered_redirect_uris and redirect_uri not in self.oauth2_service.registered_redirect_uris:
 				return HTMLResponse(
-					content="<html><body><h1>Error</h1><p>Unregistered redirect_uri</p></body></html>",
-					status_code=400
-				)
-			
-			# Валидация redirect_uri против зарегистрированных
-			if self.oauth2_service.registered_redirect_uris and redirect_uri not in self.oauth2_service.registered_redirect_uris:
-				return HTMLResponse(
-					content="<html><body><h1>Error</h1><p>Unregistered redirect_uri</p></body></html>",
+					content="<html><body><h1>Ошибка</h1><p>Незарегистрированный redirect_uri</p></body></html>",
 					status_code=400
 				)
 			
@@ -558,10 +553,9 @@ class MCPHttpServer:
 					status_code=400
 				)
 			
-			# Валидация redirect_uri против зарегистрированных
 			if self.oauth2_service.registered_redirect_uris and redirect_uri not in self.oauth2_service.registered_redirect_uris:
 				return HTMLResponse(
-					content="<html><body><h1>Error</h1><p>Unregistered redirect_uri</p></body></html>",
+					content="<html><body><h1>Ошибка</h1><p>Незарегистрированный redirect_uri</p></body></html>",
 					status_code=400
 				)
 			
@@ -783,7 +777,7 @@ class MCPHttpServer:
 			port=self.config.port,
 			log_level=self.config.log_level.lower(),
 			access_log=True,
-			forwarded_allow_ips="*"
+			forwarded_allow_ips=self.config.forwarded_allow_ips
 		)
 		
 		server = uvicorn.Server(config)

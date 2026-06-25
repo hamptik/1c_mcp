@@ -232,6 +232,7 @@ MCP_PUBLIC_URL=http://your-server:8000
 | `MCP_OAUTH2_CODE_TTL` | TTL authorization code (сек) | `120` | ❌ |
 | `MCP_OAUTH2_ACCESS_TTL` | TTL access token (сек) | `3600` | ❌ |
 | `MCP_OAUTH2_REFRESH_TTL` | TTL refresh token (сек) | `1209600` | ❌ |
+| `MCP_FORWARDED_ALLOW_IPS` | Доверенные IP прокси для X-Forwarded-* заголовков | `127.0.0.1` | ❌ |
 
 ### CLI аргументы
 

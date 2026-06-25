@@ -653,6 +653,7 @@ class OAuth2Service:
 - `MCP_OAUTH2_CODE_TTL` - TTL authorization code в секундах (по умолчанию: `120`)
 - `MCP_OAUTH2_ACCESS_TTL` - TTL access token в секундах (по умолчанию: `3600`)
 - `MCP_OAUTH2_REFRESH_TTL` - TTL refresh token в секундах (по умолчанию: `1209600`)
+- `MCP_FORWARDED_ALLOW_IPS` - доверенные IP прокси для X-Forwarded-* заголовков (по умолчанию: `127.0.0.1`)
   - `MCP_ONEC_USERNAME`/`MCP_ONEC_PASSWORD` игнорируются при `MCP_AUTH_MODE=oauth2`
 
 ### Файл `.env`
