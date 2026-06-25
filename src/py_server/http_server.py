@@ -422,6 +422,21 @@ class MCPHttpServer:
 				netloc = request.headers.get("host", f"{request.client.host}:{request.url.port}")
 				base_url = f"{scheme}://{netloc}"
 			
+			# Собираем URI от клиента (приоритетные)
+			client_uris = []
+			if "redirect_uris" in body:
+				for uri in body.get("redirect_uris", []):
+					if uri and uri not in client_uris:
+						client_uris.append(uri)
+			
+			# Fallback URI для CLI/локальных клиентов
+			fallback_uris = [
+				"http://localhost/callback",
+				"http://127.0.0.1/callback",
+			]
+			filtered_fallback = [u for u in fallback_uris if u not in client_uris]
+			all_uris = client_uris + filtered_fallback
+			
 			# Возвращаем фиксированные данные публичного клиента
 			client_data = {
 				"client_id": "mcp-public-client",
@@ -429,22 +444,15 @@ class MCPHttpServer:
 				"client_id_issued_at": 1640000000,  # Фиксированная дата
 				"grant_types": ["authorization_code", "refresh_token", "password"],
 				"response_types": ["code"],
-				"redirect_uris": [
-					f"{base_url}/callback",
-					"http://localhost/callback",
-					"http://127.0.0.1/callback"
-				],
+				"redirect_uris": all_uris,
 				"token_endpoint_auth_method": "none",  # Публичный клиент
 				"application_type": "web"
 			}
 			
-			# Если клиент передал свои redirect_uris, добавляем их
-			if "redirect_uris" in body:
-				for uri in body.get("redirect_uris", []):
-					if uri not in client_data["redirect_uris"]:
-						client_data["redirect_uris"].append(uri)
+			# Сохраняем зарегистрированные URI для валидации в /authorize
+			self.oauth2_service.registered_redirect_uris = set(all_uris)
 			
-			logger.info(f"Client registration: вернули фиксированный client_id='mcp-public-client'")
+			logger.info(f"Client registration: вернули client_id='mcp-public-client', redirect_uris={all_uris}")
 			
 			return client_data
 		
@@ -463,6 +471,20 @@ class MCPHttpServer:
 			if not all([response_type, client_id, redirect_uri, code_challenge, code_challenge_method]):
 				return HTMLResponse(
 					content="<html><body><h1>Ошибка</h1><p>Отсутствуют обязательные параметры OAuth2</p></body></html>",
+					status_code=400
+				)
+			
+			# Валидация redirect_uri против зарегистрированных
+			if self.oauth2_service.registered_redirect_uris and redirect_uri not in self.oauth2_service.registered_redirect_uris:
+				return HTMLResponse(
+					content="<html><body><h1>Error</h1><p>Unregistered redirect_uri</p></body></html>",
+					status_code=400
+				)
+			
+			# Валидация redirect_uri против зарегистрированных
+			if self.oauth2_service.registered_redirect_uris and redirect_uri not in self.oauth2_service.registered_redirect_uris:
+				return HTMLResponse(
+					content="<html><body><h1>Error</h1><p>Unregistered redirect_uri</p></body></html>",
 					status_code=400
 				)
 			
@@ -533,6 +555,13 @@ class MCPHttpServer:
 			if not all([redirect_uri, code_challenge]):
 				return HTMLResponse(
 					content="<html><body><h1>Ошибка</h1><p>Отсутствуют обязательные параметры</p></body></html>",
+					status_code=400
+				)
+			
+			# Валидация redirect_uri против зарегистрированных
+			if self.oauth2_service.registered_redirect_uris and redirect_uri not in self.oauth2_service.registered_redirect_uris:
+				return HTMLResponse(
+					content="<html><body><h1>Error</h1><p>Unregistered redirect_uri</p></body></html>",
 					status_code=400
 				)
 			
@@ -753,7 +782,8 @@ class MCPHttpServer:
 			host=self.config.host,
 			port=self.config.port,
 			log_level=self.config.log_level.lower(),
-			access_log=True
+			access_log=True,
+			forwarded_allow_ips="*"
 		)
 		
 		server = uvicorn.Server(config)

@@ -159,6 +159,7 @@ class OAuth2Service:
 		self.code_ttl = code_ttl
 		self.access_ttl = access_ttl
 		self.refresh_ttl = refresh_ttl
+		self.registered_redirect_uris: set = set()
 	
 	def generate_prm_document(self, public_url: str) -> dict:
 		"""Сгенерировать Protected Resource Metadata документ (RFC 9728).
